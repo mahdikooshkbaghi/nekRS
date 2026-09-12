@@ -1,3 +1,4 @@
+#include "nekrs.hpp"
 #include "platform.hpp"
 #include "nrs.hpp"
 #include "nekInterfaceAdapter.hpp"
@@ -28,6 +29,7 @@ static double currDt;
 static int enforceLastStep = 0;
 static int enforceCheckpointStep = 0;
 static bool initialized = false;
+static nrs_t *nrsInstance = nullptr;
 
 void printFileStdout(std::string file)
 {
@@ -177,6 +179,7 @@ void setup(MPI_Comm commg_in,
 
   if (options->compareArgs("APPLICATION", "NRS")) {
     static auto nrs = new nrs_t();
+    nrsInstance = nrs;
     platform->app = nrs;
     platform->app->bc = &nrs->bc;
   }
@@ -680,6 +683,70 @@ void finishStep()
 bool stepConverged()
 {
   return platform->app->timeStepConverged;
+}
+
+AnalysisOperationStatus captureAnalysisState(AnalysisState &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->captureAnalysisState(state.payload)) return {false, "fluid analysis state is unavailable"};
+  return {};
+}
+
+AnalysisOperationStatus restoreAnalysisState(const AnalysisState &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->restoreAnalysisState(state.payload)) return {false, "invalid or incompatible analysis state"};
+  return {};
+}
+
+AnalysisOperationStatus analysisLayout(AnalysisLayout &layout)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  std::vector<long long> ids; long long globalSize = 0; int components = 0;
+  if (!nrsInstance->analysisLayout(ids, layout.freeDofs, layout.metricWeights, globalSize, components)) return {false, "analysis layout is unavailable"};
+  layout.globalIds.resize(ids.size()); for (std::size_t n = 0; n < ids.size(); ++n) layout.globalIds[n] = static_cast<std::uint64_t>(ids[n]);
+  layout.globalSize = static_cast<std::uint64_t>(globalSize); layout.localSize = layout.globalIds.size(); layout.globalOffset = 0; layout.components = components;
+  return {};
+}
+
+AnalysisOperationStatus packAnalysisVelocity(std::vector<double> &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->packAnalysisVelocity(state)) return {false, "velocity state is unavailable"};
+  return {};
+}
+
+AnalysisOperationStatus unpackAnalysisVelocity(const std::vector<double> &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->unpackAnalysisVelocity(state)) return {false, "velocity state has the wrong layout"};
+  return {};
+}
+
+AnalysisOperationStatus packAnalysisState(std::vector<double> &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->packAnalysisState(state)) return {false, "analysis phase state is unavailable"};
+  return {};
+}
+
+AnalysisOperationStatus unpackAnalysisState(const std::vector<double> &state)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->unpackAnalysisState(state)) return {false, "analysis phase state has the wrong layout"};
+  return {};
+}
+
+AnalysisOperationStatus setAnalysisReynolds(double reynolds)
+{
+  if (!initialized || !nrsInstance) return {false, "nekRS is not initialized"};
+  if (!nrsInstance->setAnalysisReynolds(reynolds)) return {false, "unable to update Reynolds-dependent fluid properties"};
+  return {};
+}
+
+double analysisTime()
+{
+  return nrsInstance ? nrsInstance->analysisTime() : 0.0;
 }
 
 int finalize()

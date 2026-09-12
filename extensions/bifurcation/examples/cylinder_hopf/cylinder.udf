@@ -1,0 +1,19 @@
+// Stationary cylinder case: geometry and all boundary values belong to the
+// generated mesh/BC table. This file intentionally contains no continuation
+// or event logic.
+#ifdef __okl__
+void udfDirichlet(bcData *bc)
+{
+  // Unit streamwise inflow. The mesh boundary table assigns this callback to
+  // the inlet; the cylinder wall is mapped to zeroDirichlet in cylinder.par.
+  bc->uxFluid = 1.0;
+  bc->uyFluid = 0.0;
+  bc->uzFluid = 0.0;
+}
+void udfNeumann(bcData *bc) {}
+void udfRobin(bcData *bc) {}
+#endif
+
+void UDF_Setup0(MPI_Comm comm, setupAide &options) {}
+void UDF_Setup() {}
+void UDF_ExecuteStep(double time, int tstep) {}

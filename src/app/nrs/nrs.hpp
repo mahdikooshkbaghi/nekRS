@@ -96,6 +96,20 @@ public:
   void saveSolutionState();
   void restoreSolutionState();
 
+  bool captureAnalysisState(std::vector<double>& payload) const;
+  bool restoreAnalysisState(const std::vector<double>& payload);
+  bool analysisLayout(std::vector<long long>& globalIds,
+                      std::vector<unsigned char>& freeDofs,
+                      std::vector<double>& metricWeights,
+                      long long& globalSize,
+                      int& components) const;
+  bool packAnalysisVelocity(std::vector<double>& state) const;
+  bool unpackAnalysisVelocity(const std::vector<double>& state);
+  bool packAnalysisState(std::vector<double>& state) const;
+  bool unpackAnalysisState(const std::vector<double>& state);
+  bool setAnalysisReynolds(double reynolds);
+  double analysisTime() const { return timePrevious; }
+
   void computeUrst();
 
   preFluid_t preFluid = nullptr;
@@ -240,6 +254,7 @@ private:
   void setTimeIntegrationCoeffs(int tstep);
 
   double timePrevious;
+  double analysisReynolds = NAN;
 
   dfloat computeCFL();
   dfloat computeCFL(dfloat dt);

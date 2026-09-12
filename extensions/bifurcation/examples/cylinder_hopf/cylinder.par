@@ -1,0 +1,19 @@
+[GENERAL]
+polynomialOrder = 4
+cubaturePolynomialOrder = 7
+timeStepper = bdf1
+advectionSubCyclingSteps = 0
+dt = 0.02
+stopAt = numSteps
+numSteps = 1
+checkpointControl = steps
+checkpointInterval = -1
+
+[FLUID VELOCITY]
+boundaryTypeMap = udfDirichlet, udfDirichlet, zeroDirichlet, none
+viscosity = 0.021459227467811
+rho = 1.0
+residualTol = 1e-8
+
+[FLUID PRESSURE]
+residualTol = 1e-8

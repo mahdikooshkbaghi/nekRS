@@ -83,8 +83,32 @@ public:
   void saveSolutionState() override;
   void restoreSolutionState() override;
 
+  // Analysis extension hook: captures all fluid arrays that influence a
+  // repeated deterministic map evaluation. The public nekRS API keeps the
+  // payload opaque; this method remains an internal solver concern.
+  void captureAnalysisState(std::vector<double>& U,
+                            std::vector<double>& P,
+                            std::vector<double>& EXT,
+                            std::vector<double>& ADV,
+                            std::vector<double>& properties,
+                            std::vector<double>& relativeUrst,
+                            std::vector<double>& coeffEXTP) const;
+  void restoreAnalysisState(const std::vector<double>& U,
+                            const std::vector<double>& P,
+                            const std::vector<double>& EXT,
+                            const std::vector<double>& ADV,
+                            const std::vector<double>& properties,
+                            const std::vector<double>& relativeUrst,
+                            const std::vector<double>& coeffEXTP);
+  // Install only the current phase variables and rebuild all multistep/history
+  // arrays from them. This is the deterministic boundary for a velocity/
+  // pressure flow-map state.
+  void installAnalysisPhaseState(const std::vector<double>& U,
+                                 const std::vector<double>& P);
+
   void applyDirichlet(double time) override;
   void setupEllipticSolver() override;
+  void rebuildAnalysisSolvers();
 
   void makeAdvection(double time, int tstep);
   void makeExplicit(double time, int tstep);

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(NekRS LANGUAGES C CXX Fortran VERSION 26.0.1)
 
+option(NEKRS_BUILD_BIFURCATION "Build the optional NOX/LOCA bifurcation extension" OFF)
+
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
 if(${CMAKE_BINARY_DIR} STREQUAL ${CMAKE_CURRENT_SOURCE_DIR})
@@ -250,6 +252,22 @@ include(cmake/nekrs.cmake)
 include(cmake/bench.cmake)
 
 ###### Link dependencies ######
+
+if(NEKRS_BUILD_BIFURCATION)
+  set(BIF_ENABLE_NEKRS ON CACHE BOOL "Build the nekRS bifurcation adapter" FORCE)
+  # The nekRS adapter is useful without Trilinos (for embedding), while the
+  # standalone nekrs-bif executable needs NOX/LOCA/Belos/Anasazi.  Do not make
+  # a default extension build fail merely because that optional dependency is
+  # absent; users enabling BIF_ENABLE_TRILINOS get the application by default.
+  if(NOT DEFINED BIF_BUILD_APP)
+    if(BIF_ENABLE_TRILINOS)
+      set(BIF_BUILD_APP ON CACHE BOOL "Build the nekrs bifurcation executable")
+    else()
+      set(BIF_BUILD_APP OFF CACHE BOOL "Build the nekrs bifurcation executable")
+    endif()
+  endif()
+  add_subdirectory(extensions/bifurcation)
+endif()
 
 target_link_libraries(nekrs-lib PUBLIC libocca PRIVATE nekrs-hypre nekrs-hypre-device gs blas lapack std::filesystem ${CMAKE_DL_LIBS})
 target_include_directories(nekrs-lib PRIVATE ${CMAKE_BINARY_DIR})

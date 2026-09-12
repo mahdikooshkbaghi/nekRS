@@ -467,6 +467,15 @@ void fluidSolver_t::solveVelocity(double time, int stage)
   platform->timer.toc(velocityName + "Solve");
 }
 
+void fluidSolver_t::rebuildAnalysisSolvers()
+{
+  for (auto*& solver : ellipticSolver) { delete solver; solver = nullptr; }
+  ellipticSolver.clear();
+  delete ellipticSolverP;
+  ellipticSolverP = nullptr;
+  setupEllipticSolver();
+}
+
 void fluidSolver_t::setupEllipticSolver()
 {
   if (platform->options.compareArgs(upperCase(velocityName) + " SOLVER", "NONE")) {
@@ -821,6 +830,92 @@ void fluidSolver_t::restoreSolutionState()
   o_EXT.copyFrom(o_EXT0);
   o_prop.copyFrom(o_prop0);
   o_relUrst.copyFrom(o_relUrst0);
+}
+
+namespace {
+void copyDeviceToDouble(const occa::memory& source, std::vector<double>& destination)
+{
+  destination.resize(source.size());
+  if (destination.empty()) return;
+  std::vector<dfloat> temporary(source.size());
+  source.copyTo(temporary.data());
+  for (std::size_t i = 0; i < temporary.size(); ++i) destination[i] = static_cast<double>(temporary[i]);
+}
+
+void copyDoubleToDevice(const std::vector<double>& source, occa::memory& destination)
+{
+  if (!destination.isInitialized()) return;
+  if (source.size() != destination.size()) {
+    throw std::runtime_error("analysis state array has an incompatible size");
+  }
+  std::vector<dfloat> temporary(source.size());
+  for (std::size_t i = 0; i < source.size(); ++i) temporary[i] = static_cast<dfloat>(source[i]);
+  destination.copyFrom(temporary.data(), temporary.size());
+}
+}
+
+void fluidSolver_t::captureAnalysisState(std::vector<double>& U,
+                                          std::vector<double>& P,
+                                          std::vector<double>& EXT,
+                                          std::vector<double>& ADV,
+                                          std::vector<double>& properties,
+                                          std::vector<double>& relativeUrst,
+                                          std::vector<double>& coeffEXTP) const
+{
+  copyDeviceToDouble(o_U, U);
+  copyDeviceToDouble(o_P, P);
+  copyDeviceToDouble(o_EXT, EXT);
+  copyDeviceToDouble(o_ADV, ADV);
+  copyDeviceToDouble(o_prop, properties);
+  copyDeviceToDouble(o_relUrst, relativeUrst);
+  copyDeviceToDouble(o_coeffEXTP, coeffEXTP);
+}
+
+void fluidSolver_t::restoreAnalysisState(const std::vector<double>& U,
+                                         const std::vector<double>& P,
+                                         const std::vector<double>& EXT,
+                                         const std::vector<double>& ADV,
+                                         const std::vector<double>& properties,
+                                         const std::vector<double>& relativeUrst,
+                                         const std::vector<double>& coeffEXTP)
+{
+  copyDoubleToDevice(U, o_U);
+  copyDoubleToDevice(P, o_P);
+  copyDoubleToDevice(EXT, o_EXT);
+  copyDoubleToDevice(ADV, o_ADV);
+  copyDoubleToDevice(properties, o_prop);
+  copyDoubleToDevice(relativeUrst, o_relUrst);
+  copyDoubleToDevice(coeffEXTP, o_coeffEXTP);
+}
+
+void fluidSolver_t::installAnalysisPhaseState(const std::vector<double>& U,
+                                               const std::vector<double>& P)
+{
+  const auto fieldOffsetSum = mesh->dim * fieldOffset;
+  if (U.size() != static_cast<std::size_t>(fieldOffsetSum) ||
+      P.size() != static_cast<std::size_t>(fieldOffset)) {
+    throw std::runtime_error("analysis phase state has an incompatible size");
+  }
+
+  std::vector<dfloat> u(U.size()), p(P.size());
+  for (std::size_t n = 0; n < U.size(); ++n) u[n] = static_cast<dfloat>(U[n]);
+  for (std::size_t n = 0; n < P.size(); ++n) p[n] = static_cast<dfloat>(P[n]);
+
+  auto uCurrent = o_U.slice(0, fieldOffsetSum);
+  uCurrent.copyFrom(u.data(), u.size());
+  for (std::size_t offset = fieldOffsetSum; offset < o_U.size(); offset += fieldOffsetSum)
+    o_U.copyFrom(o_U, fieldOffsetSum, offset, 0);
+
+  auto pCurrent = o_P.slice(0, fieldOffset);
+  pCurrent.copyFrom(p.data(), p.size());
+  for (std::size_t offset = fieldOffset; offset < o_P.size(); offset += fieldOffset)
+    o_P.copyFrom(o_P, fieldOffset, offset, 0);
+
+  platform->linAlg->fill(o_EXT.size(), 0.0, o_EXT);
+  platform->linAlg->fill(o_ADV.size(), 0.0, o_ADV);
+  platform->linAlg->fill(o_relUrst.size(), 0.0, o_relUrst);
+  // o_Ue/o_Pe are derived extrapolation work arrays and are rebuilt by
+  // nrs_t::initStep; do not clear o_Ue here when it aliases o_U.
 }
 
 void fluidSolver_t::extrapolateSolution()

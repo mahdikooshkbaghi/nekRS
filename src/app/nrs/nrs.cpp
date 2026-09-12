@@ -1868,6 +1868,259 @@ void nrs_t::restoreSolutionState()
   }
 }
 
+namespace {
+void appendAnalysisVector(std::vector<double>& payload, const std::vector<double>& values)
+{
+  payload.push_back(static_cast<double>(values.size()));
+  payload.insert(payload.end(), values.begin(), values.end());
+}
+
+bool readAnalysisVector(const std::vector<double>& payload, std::size_t& cursor, std::vector<double>& values)
+{
+  if (cursor >= payload.size() || payload[cursor] < 0.0 || !std::isfinite(payload[cursor]) ||
+      std::floor(payload[cursor]) != payload[cursor]) return false;
+  const auto count = static_cast<std::size_t>(payload[cursor++]);
+  if (count > payload.size() - cursor) return false;
+  values.assign(payload.begin() + cursor, payload.begin() + cursor + count);
+  cursor += count;
+  return true;
+}
+
+void copyAnalysisVectorToDevice(const std::vector<double>& values, occa::memory& destination)
+{
+  if (!destination.isInitialized() || values.size() != destination.size()) throw std::runtime_error("invalid analysis coefficient state");
+  std::vector<dfloat> converted(values.size());
+  for (std::size_t n = 0; n < values.size(); ++n) converted[n] = static_cast<dfloat>(values[n]);
+  destination.copyFrom(converted.data(), converted.size());
+}
+
+void copyAnalysisDeviceToVector(const occa::memory& source, std::vector<double>& values)
+{
+  values.resize(source.size());
+  if (values.empty()) return;
+  std::vector<dfloat> converted(source.size());
+  source.copyTo(converted.data());
+  for (std::size_t n = 0; n < converted.size(); ++n) values[n] = static_cast<double>(converted[n]);
+}
+
+struct AnalysisNodes {
+  std::vector<dlong> owned;
+  std::vector<std::vector<std::size_t>> freeOwned;
+  std::vector<hlong> ids;
+  std::vector<unsigned char> constrained;
+  std::vector<double> weights;
+};
+
+AnalysisNodes analysisNodes(const nrs_t& nrs)
+{
+  AnalysisNodes result;
+  auto* mesh = nrs.meshV;
+  int rank = platform->comm.mpiRank();
+  std::vector<int> owner(mesh->Nlocal, rank);
+  ogsGatherScatter(owner.data(), ogsInt, ogsMin, mesh->ogs);
+
+  std::vector<int> constrained(mesh->Nlocal * mesh->dim, 0);
+  for (dlong e = 0; e < mesh->Nelements; ++e) {
+    for (int face = 0; face < mesh->Nfaces; ++face) {
+      const int bid = mesh->EToB[face + e * mesh->Nfaces];
+      const int type = nrs.bc.typeId(bid, "fluid velocity");
+      int components = 0;
+      switch (type) {
+      case bdryBase::bcType_zeroDirichlet:
+      case bdryBase::bcType_udfDirichlet: components = (1 << mesh->dim) - 1; break;
+      case bdryBase::bcType_zeroDirichletX_zeroNeumann:
+      case bdryBase::bcType_zeroDirichletX_udfNeumann: components = 1; break;
+      case bdryBase::bcType_zeroDirichletY_zeroNeumann:
+      case bdryBase::bcType_zeroDirichletY_udfNeumann: components = 2; break;
+      case bdryBase::bcType_zeroDirichletZ_zeroNeumann:
+      case bdryBase::bcType_zeroDirichletZ_udfNeumann: components = 4; break;
+      case bdryBase::bcType_zeroDirichletN_zeroNeumann:
+      case bdryBase::bcType_zeroDirichletN_udfNeumann: components = (1 << mesh->dim) - 1; break;
+      default: break;
+      }
+      for (int node = 0; node < mesh->Nfp; ++node) {
+        const dlong local = mesh->vmapM[face * mesh->Nfp + node + e * mesh->Nfp * mesh->Nfaces];
+        for (int c = 0; c < mesh->dim; ++c) if (components & (1 << c)) constrained[c * mesh->Nlocal + local] = 1;
+      }
+    }
+  }
+  for (int c = 0; c < mesh->dim; ++c) ogsGatherScatter(constrained.data() + c * mesh->Nlocal, ogsInt, ogsMax, mesh->ogs);
+
+  std::vector<dfloat> localWeights(mesh->Nlocal);
+  mesh->o_LMM.copyTo(localWeights.data());
+  ogsGatherScatter(localWeights.data(), dfloatString, ogsAdd, mesh->ogs);
+  std::vector<std::pair<hlong, dlong>> ordered;
+  for (dlong n = 0; n < mesh->Nlocal; ++n) if (owner[n] == rank) ordered.push_back({mesh->globalIds[n], n});
+  std::sort(ordered.begin(), ordered.end());
+  result.owned.reserve(ordered.size()); result.ids.reserve(ordered.size());
+  for (const auto& entry : ordered) { result.ids.push_back(entry.first); result.owned.push_back(entry.second); }
+  result.constrained.resize(result.owned.size() * mesh->dim);
+  result.weights.resize(result.owned.size() * mesh->dim);
+  result.freeOwned.resize(mesh->dim);
+  for (int c = 0; c < mesh->dim; ++c) for (std::size_t i = 0; i < result.owned.size(); ++i) {
+    result.constrained[c * result.owned.size() + i] = constrained[c * mesh->Nlocal + result.owned[i]] ? 0 : 1;
+    result.weights[c * result.owned.size() + i] = static_cast<double>(localWeights[result.owned[i]]);
+    if (result.constrained[c * result.owned.size() + i]) result.freeOwned[c].push_back(i);
+  }
+  double localVolume = 0.0; for (double w : result.weights) localVolume += w;
+  MPI_Allreduce(MPI_IN_PLACE, &localVolume, 1, MPI_DOUBLE, MPI_SUM, platform->comm.mpiComm());
+  if (localVolume > 0.0) for (auto& w : result.weights) w /= localVolume;
+  return result;
+}
+}
+
+bool nrs_t::captureAnalysisState(std::vector<double>& payload) const
+{
+  if (!fluid || !meshV) return false;
+  std::vector<double> U, P, EXT, ADV, properties, relativeUrst, coeffEXTP, coeffEXT, coeffBDF;
+  fluid->captureAnalysisState(U, P, EXT, ADV, properties, relativeUrst, coeffEXTP);
+  copyAnalysisDeviceToVector(o_coeffEXT, coeffEXT);
+  copyAnalysisDeviceToVector(o_coeffBDF, coeffBDF);
+  auto reynolds = analysisReynolds;
+  if (!(reynolds > 0.0)) {
+    dfloat viscosity = 0.0; platform->options.getArgs("FLUID VISCOSITY", viscosity);
+    reynolds = viscosity > 0.0 ? 1.0 / viscosity : 0.0;
+  }
+  payload = {9.2718281828459045, timePrevious, static_cast<double>(tstep), dt[0], dt[1], dt[2], static_cast<double>(g0), static_cast<double>(outerCorrector), static_cast<double>(lastStep), static_cast<double>(checkpointStep), reynolds};
+  appendAnalysisVector(payload, U); appendAnalysisVector(payload, P); appendAnalysisVector(payload, EXT); appendAnalysisVector(payload, ADV);
+  appendAnalysisVector(payload, properties); appendAnalysisVector(payload, relativeUrst); appendAnalysisVector(payload, coeffEXTP);
+  appendAnalysisVector(payload, coeffEXT); appendAnalysisVector(payload, coeffBDF);
+  return true;
+}
+
+bool nrs_t::restoreAnalysisState(const std::vector<double>& payload)
+{
+  if (!fluid || payload.size() < 11 || payload[0] != 9.2718281828459045) return false;
+  for (std::size_t i = 1; i < 11; ++i) if (!std::isfinite(payload[i])) return false;
+  std::size_t cursor = 11; std::vector<double> U, P, EXT, ADV, properties, relativeUrst, coeffEXTP, coeffEXT, coeffBDF;
+  if (!readAnalysisVector(payload, cursor, U) || !readAnalysisVector(payload, cursor, P) || !readAnalysisVector(payload, cursor, EXT) ||
+      !readAnalysisVector(payload, cursor, ADV) || !readAnalysisVector(payload, cursor, properties) ||
+      !readAnalysisVector(payload, cursor, relativeUrst) || !readAnalysisVector(payload, cursor, coeffEXTP) ||
+      !readAnalysisVector(payload, cursor, coeffEXT) || !readAnalysisVector(payload, cursor, coeffBDF) || cursor != payload.size()) return false;
+  try {
+    fluid->restoreAnalysisState(U, P, EXT, ADV, properties, relativeUrst, coeffEXTP);
+    copyAnalysisVectorToDevice(coeffEXT, o_coeffEXT); copyAnalysisVectorToDevice(coeffBDF, o_coeffBDF);
+  } catch (...) { return false; }
+  timePrevious = payload[1]; tstep = static_cast<int>(payload[2]); dt[0] = payload[3]; dt[1] = payload[4]; dt[2] = payload[5];
+  g0 = static_cast<dfloat>(payload[6]); outerCorrector = static_cast<int>(payload[7]); lastStep = static_cast<int>(payload[8]); checkpointStep = static_cast<int>(payload[9]);
+  analysisReynolds = payload[10];
+  if (analysisReynolds > 0.0) platform->options.setArgs("FLUID VISCOSITY", std::to_string(1.0 / analysisReynolds));
+  fluid->rebuildAnalysisSolvers();
+  return true;
+}
+
+bool nrs_t::analysisLayout(std::vector<long long>& globalIds,
+                           std::vector<unsigned char>& freeDofs,
+                           std::vector<double>& metricWeights,
+                           long long& globalSize,
+                           int& components) const
+{
+  if (!fluid || !meshV || !meshV->globalIds) return false;
+  const auto nodes = analysisNodes(*this);
+  // The autonomous phase state contains current velocity and pressure.  The
+  // multistep/history/work arrays are reconstructed from these variables by
+  // unpackAnalysisState, so clocks and solver workspaces are not unknowns.
+  components = meshV->dim + 1; globalSize = static_cast<long long>(meshV->Nglobal) * components;
+  std::size_t localSize = 0;
+  for (const auto& free : nodes.freeOwned) localSize += free.size();
+  for (const auto id : nodes.ids) if (id != 0) ++localSize;
+  globalIds.resize(localSize); freeDofs.assign(localSize, 1); metricWeights.resize(localSize);
+  std::size_t cursor = 0;
+  for (int c = 0; c < meshV->dim; ++c) {
+    for (const auto ownedIndex : nodes.freeOwned[c]) {
+      globalIds[cursor] = static_cast<long long>(c * meshV->Nglobal + nodes.ids[ownedIndex]);
+      metricWeights[cursor++] = nodes.weights[c * nodes.ids.size() + ownedIndex];
+    }
+  }
+  for (std::size_t i = 0; i < nodes.ids.size(); ++i) if (nodes.ids[i] != 0) {
+    globalIds[cursor] = static_cast<long long>(meshV->dim * meshV->Nglobal + nodes.ids[i]);
+    metricWeights[cursor++] = nodes.weights[i];
+  }
+  return true;
+}
+
+bool nrs_t::packAnalysisVelocity(std::vector<double>& state) const
+{
+  if (!fluid || !meshV) return false;
+  const auto nodes = analysisNodes(*this); std::vector<dfloat> U(fluid->o_U.size()); fluid->o_U.copyTo(U.data());
+  state.resize(nodes.owned.size() * meshV->dim);
+  for (int c = 0; c < meshV->dim; ++c) for (std::size_t i = 0; i < nodes.owned.size(); ++i) state[c * nodes.owned.size() + i] = static_cast<double>(U[c * fluid->fieldOffset + nodes.owned[i]]);
+  return true;
+}
+
+bool nrs_t::unpackAnalysisVelocity(const std::vector<double>& state)
+{
+  if (!fluid || !meshV) return false;
+  const auto nodes = analysisNodes(*this); if (state.size() != nodes.owned.size() * meshV->dim) return false;
+  std::vector<dfloat> U(fluid->o_U.size()); fluid->o_U.copyTo(U.data());
+  for (int c = 0; c < meshV->dim; ++c) {
+    std::vector<dfloat> values(meshV->Nlocal, 0.0);
+    for (std::size_t i = 0; i < nodes.owned.size(); ++i) values[nodes.owned[i]] = static_cast<dfloat>(state[c * nodes.owned.size() + i]);
+    ogsGatherScatter(values.data(), dfloatString, ogsAdd, meshV->ogs);
+    for (dlong n = 0; n < meshV->Nlocal; ++n) U[c * fluid->fieldOffset + n] = values[n];
+  }
+  fluid->o_U.copyFrom(U.data(), U.size());
+  fluid->applyDirichlet(timePrevious);
+  return true;
+}
+
+bool nrs_t::packAnalysisState(std::vector<double>& state) const
+{
+  if (!fluid || !meshV) return false;
+  const auto nodes = analysisNodes(*this);
+  std::vector<dfloat> U(fluid->o_U.size()), P(fluid->o_P.size());
+  fluid->o_U.copyTo(U.data()); fluid->o_P.copyTo(P.data());
+  const auto count = nodes.owned.size();
+  std::size_t localSize = 0;
+  for (const auto& free : nodes.freeOwned) localSize += free.size();
+  for (const auto id : nodes.ids) if (id != 0) ++localSize;
+  state.resize(localSize);
+  std::size_t cursor = 0;
+  for (int c = 0; c < meshV->dim; ++c)
+    for (const auto ownedIndex : nodes.freeOwned[c])
+      state[cursor++] = static_cast<double>(U[c * fluid->fieldOffset + nodes.owned[ownedIndex]]);
+  for (std::size_t i = 0; i < count; ++i)
+    if (nodes.ids[i] != 0) state[cursor++] = static_cast<double>(P[nodes.owned[i]]);
+  return true;
+}
+
+bool nrs_t::unpackAnalysisState(const std::vector<double>& state)
+{
+  if (!fluid || !meshV) return false;
+  const auto nodes = analysisNodes(*this); const auto count = nodes.owned.size();
+  std::size_t localSize = 0;
+  for (const auto& free : nodes.freeOwned) localSize += free.size();
+  for (const auto id : nodes.ids) if (id != 0) ++localSize;
+  if (state.size() != localSize) return false;
+  std::vector<double> U(meshV->dim * fluid->fieldOffset, 0.0), P(fluid->fieldOffset, 0.0);
+  std::size_t cursor = 0;
+  for (int c = 0; c < meshV->dim; ++c) {
+    std::vector<dfloat> values(meshV->Nlocal, 0.0);
+    for (const auto ownedIndex : nodes.freeOwned[c])
+      values[nodes.owned[ownedIndex]] = static_cast<dfloat>(state[cursor++]);
+    ogsGatherScatter(values.data(), dfloatString, ogsAdd, meshV->ogs);
+    for (dlong n = 0; n < fluid->fieldOffset; ++n) U[c * fluid->fieldOffset + n] = values[n];
+  }
+  std::vector<dfloat> pressure(meshV->Nlocal, 0.0);
+  for (std::size_t i = 0; i < count; ++i)
+    if (nodes.ids[i] != 0) pressure[nodes.owned[i]] = static_cast<dfloat>(state[cursor++]);
+  ogsGatherScatter(pressure.data(), dfloatString, ogsAdd, meshV->ogs);
+  for (dlong n = 0; n < fluid->fieldOffset; ++n) P[n] = pressure[n];
+  fluid->installAnalysisPhaseState(U, P);
+  fluid->applyDirichlet(timePrevious);
+  return true;
+}
+
+bool nrs_t::setAnalysisReynolds(double reynolds)
+{
+  if (!fluid || !(reynolds > 0.0) || !std::isfinite(reynolds)) return false;
+  analysisReynolds = reynolds;
+  platform->options.setArgs("FLUID VISCOSITY", std::to_string(1.0 / reynolds));
+  evaluateProperties(timePrevious);
+  fluid->rebuildAnalysisSolvers();
+  return true;
+}
+
 dfloat nrs_t::computeCFL()
 {
   return computeCFL(fluid->mesh, fluid->o_U, dt[0]);

@@ -3,7 +3,10 @@
 
 #include <mpi.h>
 #include <functional>
+#include <map>
 #include <string>
+#include <vector>
+#include <cstdint>
 
 /*
   Basic high-level API
@@ -53,6 +56,38 @@ bool runStep(int corrector);
 void finishStep();
 bool stepConverged();
 int timeStep();
+
+// Optional analysis-state boundary used by extensions. The payload is opaque
+// and must only be restored with the same mesh, discretization and rank layout.
+struct AnalysisState {
+  std::vector<double> payload;
+};
+struct AnalysisLayout {
+  std::uint64_t globalSize = 0;
+  std::uint64_t localSize = 0;
+  std::uint64_t globalOffset = 0;
+  int components = 0;
+  std::vector<std::uint64_t> globalIds;
+  std::vector<unsigned char> freeDofs;
+  std::vector<double> metricWeights;
+};
+struct AnalysisOperationStatus {
+  bool success = true;
+  std::string message;
+  explicit operator bool() const { return success; }
+};
+AnalysisOperationStatus captureAnalysisState(AnalysisState &state);
+AnalysisOperationStatus restoreAnalysisState(const AnalysisState &state);
+AnalysisOperationStatus analysisLayout(AnalysisLayout &layout);
+AnalysisOperationStatus packAnalysisVelocity(std::vector<double> &state);
+AnalysisOperationStatus unpackAnalysisVelocity(const std::vector<double> &state);
+// Pack the autonomous velocity/pressure phase state used by the optional
+// flow-map adapter.  Histories and work arrays are reconstructed
+// deterministically from this phase state before each trial map evaluation.
+AnalysisOperationStatus packAnalysisState(std::vector<double> &state);
+AnalysisOperationStatus unpackAnalysisState(const std::vector<double> &state);
+AnalysisOperationStatus setAnalysisReynolds(double reynolds);
+double analysisTime();
 double finalTimeStepSize(double time);
 } // namespace nekrs
 
